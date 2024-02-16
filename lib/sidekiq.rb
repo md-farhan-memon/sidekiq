@@ -178,8 +178,46 @@ module Sidekiq
     end
   end
 
+  def self.replica_redis
+    raise ArgumentError, "requires a block" unless block_given?
+    replica_redis_pool.with do |conn|
+      retryable = true
+      begin
+        yield conn
+      rescue RedisConnection.adapter::BaseError => ex
+        # 2550 Failover can cause the server to become a replica, need
+        # to disconnect and reopen the socket to get back to the primary.
+        # 4495 Use the same logic if we have a "Not enough replicas" error from the primary
+        # 4985 Use the same logic when a blocking command is force-unblocked
+        # The same retry logic is also used in client.rb
+        if retryable && ex.message =~ /READONLY|NOREPLICAS|UNBLOCKED/
+          conn.disconnect!
+          retryable = false
+          retry
+        end
+        raise
+      end
+    end
+  end
+
   def self.redis_info
     redis do |conn|
+      # admin commands can't go through redis-namespace starting
+      # in redis-namespace 2.0
+      if conn.respond_to?(:namespace)
+        conn.redis.info
+      else
+        conn.info
+      end
+    rescue RedisConnection.adapter::CommandError => ex
+      # 2850 return fake version when INFO command has (probably) been renamed
+      raise unless /unknown command/.match?(ex.message)
+      FAKE_INFO
+    end
+  end
+
+  def self.replica_redis_info
+    replica_redis do |conn|
       # admin commands can't go through redis-namespace starting
       # in redis-namespace 2.0
       if conn.respond_to?(:namespace)
@@ -198,11 +236,23 @@ module Sidekiq
     @redis ||= RedisConnection.create
   end
 
+  def self.replica_redis_pool
+    @replica_redis
+  end
+
   def self.redis=(hash)
     @redis = if hash.is_a?(ConnectionPool)
       hash
     else
       RedisConnection.create(hash)
+    end
+  end
+
+  def self.replica_redis=(hash)
+    @replica_redis = if hash.is_a?(ConnectionPool)
+      hash
+    else
+      raise
     end
   end
 
